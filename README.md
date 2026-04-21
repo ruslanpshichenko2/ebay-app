@@ -1,59 +1,61 @@
 # eBay & Facebook Marketplace Listing Generator
 
-This app turns product photos into listing copy for:
+Create eBay and Facebook Marketplace listing copy from product photos.
 
-- eBay
-- Facebook Marketplace
+## What It Does
 
-## Download From GitHub
+- Upload up to 10 product photos
+- Choose the item condition
+- Add PN / notes / defects
+- Generate eBay and Facebook Marketplace titles and descriptions
+- Optionally use active eBay listings for price comps
 
-1. Open this repo in your browser.
-2. Click the green `Code` button.
-3. Click `Download ZIP`.
-4. Unzip the folder on your computer.
+## Use The Hosted App
 
-## What You Need
+Open the shared Streamlit link from the app owner.
 
-- Python 3.9 or newer
-- An OpenAI API key
+If the app asks for secrets, the owner needs to add them in Streamlit Cloud settings.
 
-## Set Up
+## Run It Locally
 
-Open Terminal in the project folder and run:
+1. Download this repo with `Code` > `Download ZIP`.
+2. Unzip the folder.
+3. Open Terminal in the folder.
+4. Install the requirements:
 
 ```bash
 python3 -m pip install -r requirements.txt
 ```
 
-Create a file named `.env` in the project folder and add:
+5. Copy `.env.example` to a new file named `.env`.
+6. Add your OpenAI API key:
 
 ```text
 OPENAI_API_KEY=your_openai_key_here
 ```
 
-You can copy `.env.example` and replace the placeholder values.
-
-## Run The App
-
-Option 1:
-
-Double-click:
-
-`launch_marketplace_app.command`
-
-Option 2:
-
-Run it manually:
+7. Start the app:
 
 ```bash
 python3 -m streamlit run app.py
 ```
 
-Then open:
+8. Open:
 
 ```text
 http://localhost:8501
 ```
+
+## Optional eBay Pricing
+
+To use active eBay listing comps, add these to `.env`:
+
+```text
+EBAY_CLIENT_ID=your_ebay_client_id_here
+EBAY_CLIENT_SECRET=your_ebay_client_secret_here
+```
+
+The app still works without these, but pricing will fall back to the AI-generated range.
 
 ## Important
 

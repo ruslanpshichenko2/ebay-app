@@ -7,8 +7,6 @@ import os
 import re
 import statistics
 import time
-import uuid
-import xml.etree.ElementTree as ET
 from typing import Any, Optional
 from urllib import error, parse, request
 
@@ -26,27 +24,13 @@ except ImportError:
 MODEL_NAME = "gpt-4.1"
 MAX_IMAGES = 10
 CONDITION_OPTIONS = ["New", "Like New", "Used - Good", "Used - Fair"]
-EBAY_API_COMPATIBILITY_LEVEL = "1231"
-EBAY_XML_NS = {"ebay": "urn:ebay:apis:eBLBaseComponents"}
-EBAY_OAUTH_SCOPES = (
-    "https://api.ebay.com/oauth/api_scope/sell.inventory "
-    "https://api.ebay.com/oauth/api_scope/sell.account"
-)
-CONDITION_TO_EBAY_ENUM = {
-    "New": "NEW",
-    "Like New": "LIKE_NEW",
-    "Used - Good": "USED_GOOD",
-    "Used - Fair": "USED_ACCEPTABLE",
-}
-CONDITION_TO_COMPLETED_FILTER_ID = {
+CONDITION_TO_EBAY_CONDITION_ID = {
     "New": "1000",
     "Like New": "2750",
     "Used - Good": "5000",
     "Used - Fair": "6000",
 }
-EBAY_DRAFTS_URL = "https://www.ebay.com/sh/lst/drafts"
 FACEBOOK_MARKETPLACE_CREATE_URL = "https://www.facebook.com/marketplace/create/item"
-FINDING_API_VERSION = "1.13.0"
 LISTING_TYPE_OPTIONS = ["Both", "eBay Only", "Facebook Only"]
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -97,46 +81,10 @@ def get_env_value(name: str, required: bool = True, default: Optional[str] = Non
     return value or ""
 
 
-def get_ebay_config() -> dict[str, str]:
-    environment = get_env_value("EBAY_ENVIRONMENT", required=False, default="production").lower()
-    api_domain = "api.sandbox.ebay.com" if environment == "sandbox" else "api.ebay.com"
-    finding_domain = "svcs.sandbox.ebay.com" if environment == "sandbox" else "svcs.ebay.com"
-
-    return {
-        "client_id": get_env_value("EBAY_CLIENT_ID"),
-        "client_secret": get_env_value("EBAY_CLIENT_SECRET"),
-        "refresh_token": get_env_value("EBAY_REFRESH_TOKEN"),
-        "marketplace_id": get_env_value("EBAY_MARKETPLACE_ID", required=False, default="EBAY_US"),
-        "content_language": get_env_value("EBAY_CONTENT_LANGUAGE", required=False, default="en-US"),
-        "site_id": get_env_value("EBAY_SITE_ID", required=False, default="0"),
-        "api_domain": api_domain,
-        "finding_domain": finding_domain,
-    }
-
-
-def get_ebay_oauth_setup_config() -> dict[str, str]:
-    environment = get_env_value("EBAY_ENVIRONMENT", required=False, default="production").lower()
-    auth_domain = "auth.sandbox.ebay.com" if environment == "sandbox" else "auth.ebay.com"
-    api_domain = "api.sandbox.ebay.com" if environment == "sandbox" else "api.ebay.com"
-
-    return {
-        "client_id": get_env_value("EBAY_CLIENT_ID"),
-        "client_secret": get_env_value("EBAY_CLIENT_SECRET"),
-        "runame": (
-            os.getenv("EBAY_RUNAME")
-            or os.getenv("EBAY_RU_NAME")
-            or os.getenv("EBAY_REDIRECT_URI_NAME")
-            or ""
-        ).strip(),
-        "auth_domain": auth_domain,
-        "api_domain": api_domain,
-    }
-
-
 def get_ebay_public_config() -> dict[str, str]:
     environment = get_env_value("EBAY_ENVIRONMENT", required=False, default="production").lower()
     api_domain = "api.sandbox.ebay.com" if environment == "sandbox" else "api.ebay.com"
-    client_id = os.getenv("EBAY_CLIENT_ID") or os.getenv("EBAY_APP_ID")
+    client_id = os.getenv("EBAY_CLIENT_ID")
     client_secret = os.getenv("EBAY_CLIENT_SECRET")
     if not client_id or not client_secret:
         raise RuntimeError(
@@ -148,17 +96,6 @@ def get_ebay_public_config() -> dict[str, str]:
         "client_secret": client_secret,
         "api_domain": api_domain,
         "marketplace_id": get_env_value("EBAY_MARKETPLACE_ID", required=False, default="EBAY_US"),
-    }
-
-
-def get_ebay_publish_config() -> dict[str, str]:
-    return {
-        "category_id": get_env_value("EBAY_CATEGORY_ID"),
-        "merchant_location_key": get_env_value("EBAY_MERCHANT_LOCATION_KEY"),
-        "fulfillment_policy_id": get_env_value("EBAY_FULFILLMENT_POLICY_ID"),
-        "payment_policy_id": get_env_value("EBAY_PAYMENT_POLICY_ID"),
-        "return_policy_id": get_env_value("EBAY_RETURN_POLICY_ID"),
-        "listing_duration": get_env_value("EBAY_LISTING_DURATION", required=False, default="GTC"),
     }
 
 
@@ -217,25 +154,6 @@ def render_image_previews(uploaded_files: list[Any]) -> None:
     st.markdown("".join(preview_blocks), unsafe_allow_html=True)
 
 
-def build_condition_description(
-    visible_condition_clues: list[str],
-    additional_details: str,
-) -> str:
-    parts: list[str] = []
-    if visible_condition_clues:
-        parts.append("Visible condition clues: " + "; ".join(visible_condition_clues))
-    if additional_details:
-        parts.append("Additional seller details: " + additional_details.strip())
-    return " | ".join(part for part in parts if part).strip()[:1000]
-
-
-def normalize_price_value(price_text: str) -> str:
-    match = re.search(r"\d[\d,]*(?:\.\d{1,2})?", price_text)
-    if not match:
-        raise RuntimeError(f"Could not parse a numeric eBay price from: {price_text}")
-    return match.group(0).replace(",", "")
-
-
 def format_price_display(price_text: str) -> str:
     cleaned = (price_text or "").strip()
     if not cleaned:
@@ -247,14 +165,6 @@ def format_price_display(price_text: str) -> str:
     if match:
         return f"${match.group(0)}"
     return cleaned
-
-
-def build_price_options(pricing: dict[str, Any]) -> dict[str, str]:
-    return {
-        "Quick Sale": pricing.get("quick_sale_price", ""),
-        "Market Price": pricing.get("market_price", ""),
-        "High-End": pricing.get("high_end_price", ""),
-    }
 
 
 def extract_part_number(additional_details: str) -> str:
@@ -562,7 +472,7 @@ def fetch_active_listing_prices(
         if fixed_price_only:
             filters.append("buyingOptions:{FIXED_PRICE}")
         if include_condition_filter:
-            filters.append(f"conditionIds:{{{CONDITION_TO_COMPLETED_FILTER_ID[condition]}}}")
+            filters.append(f"conditionIds:{{{CONDITION_TO_EBAY_CONDITION_ID[condition]}}}")
 
         params = {
             "q": query,
@@ -669,31 +579,6 @@ def fetch_active_listing_prices(
     return recommended
 
 
-def get_ebay_user_token(config: dict[str, str]) -> str:
-    token_url = f"https://{config['api_domain']}/identity/v1/oauth2/token"
-    credentials = f"{config['client_id']}:{config['client_secret']}".encode("utf-8")
-    auth_header = base64.b64encode(credentials).decode("utf-8")
-    payload = parse.urlencode(
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": config["refresh_token"],
-            "scope": EBAY_OAUTH_SCOPES,
-        }
-    ).encode("utf-8")
-
-    _, body = ebay_request(
-        method="POST",
-        url=token_url,
-        headers={
-            "Authorization": f"Basic {auth_header}",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        data=payload,
-    )
-    token_data = json.loads(body)
-    return token_data["access_token"]
-
-
 def get_ebay_application_token(config: dict[str, str]) -> str:
     cache_key = f"{config['client_id']}::{config['api_domain']}"
     cache_bucket = st.session_state.setdefault("ebay_application_token_cache", {})
@@ -733,419 +618,6 @@ def get_ebay_application_token(config: dict[str, str]) -> str:
         "expires_at": now + expires_in,
     }
     return access_token
-
-
-def build_ebay_consent_url(config: dict[str, str]) -> str:
-    if not config["runame"]:
-        raise RuntimeError(
-            "Set EBAY_RUNAME in .env after creating your eBay RuName/OAuth redirect configuration."
-        )
-
-    query = parse.urlencode(
-        {
-            "client_id": config["client_id"],
-            "redirect_uri": config["runame"],
-            "response_type": "code",
-            "scope": EBAY_OAUTH_SCOPES,
-        }
-    )
-    return f"https://{config['auth_domain']}/oauth2/authorize?{query}"
-
-
-def extract_ebay_auth_code(auth_input: str) -> str:
-    cleaned = (auth_input or "").strip()
-    if not cleaned:
-        raise RuntimeError("Paste the full eBay callback URL or the raw authorization code.")
-
-    if "code=" in cleaned:
-        parsed_url = parse.urlparse(cleaned)
-        query_values = parse.parse_qs(parsed_url.query)
-        code = query_values.get("code", [""])[0]
-        if not code:
-            raise RuntimeError("The callback URL did not include a code parameter.")
-        return parse.unquote(code).strip()
-
-    return parse.unquote(cleaned).strip()
-
-
-def exchange_ebay_authorization_code(
-    auth_input: str,
-) -> dict[str, str]:
-    config = get_ebay_oauth_setup_config()
-    if not config["runame"]:
-        raise RuntimeError(
-            "EBAY_RUNAME is missing. Add the RuName value from eBay OAuth settings to your .env file."
-        )
-
-    token_url = f"https://{config['api_domain']}/identity/v1/oauth2/token"
-    credentials = f"{config['client_id']}:{config['client_secret']}".encode("utf-8")
-    auth_header = base64.b64encode(credentials).decode("utf-8")
-    authorization_code = extract_ebay_auth_code(auth_input)
-    payload = parse.urlencode(
-        {
-            "grant_type": "authorization_code",
-            "code": authorization_code,
-            "redirect_uri": config["runame"],
-        }
-    ).encode("utf-8")
-
-    _, body = ebay_request(
-        method="POST",
-        url=token_url,
-        headers={
-            "Authorization": f"Basic {auth_header}",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        data=payload,
-    )
-    token_data = json.loads(body)
-    refresh_token = token_data.get("refresh_token", "")
-    if not refresh_token:
-        raise RuntimeError("eBay did not return a refresh token from the authorization code exchange.")
-
-    return {
-        "refresh_token": refresh_token,
-        "access_token": token_data.get("access_token", ""),
-    }
-
-
-def test_ebay_authentication() -> str:
-    config = get_ebay_config()
-    get_ebay_user_token(config)
-    return "eBay authentication succeeded. Your client ID, client secret, and refresh token match."
-
-
-def upload_image_to_ebay(
-    access_token: str,
-    uploaded_file: Any,
-    site_id: str,
-    api_domain: str,
-) -> str:
-    boundary = f"----CodexBoundary{uuid.uuid4().hex}"
-    xml_payload = """<?xml version="1.0" encoding="utf-8"?>
-<UploadSiteHostedPicturesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <PictureName>{picture_name}</PictureName>
-  <PictureSet>Supersize</PictureSet>
-</UploadSiteHostedPicturesRequest>
-""".format(picture_name=uploaded_file.name)
-
-    binary, mime_type = get_image_bytes_and_mime_type(uploaded_file)
-    picture_name = uploaded_file.name
-    if is_heic_file(uploaded_file):
-        picture_name = os.path.splitext(uploaded_file.name)[0] + ".jpg"
-
-    body = b"".join(
-        [
-            f"--{boundary}\r\n".encode("utf-8"),
-            b'Content-Disposition: form-data; name="XML Payload"\r\n\r\n',
-            xml_payload.encode("utf-8"),
-            b"\r\n",
-            f"--{boundary}\r\n".encode("utf-8"),
-            (
-                f'Content-Disposition: form-data; name="{picture_name}"; '
-                f'filename="{picture_name}"\r\n'
-            ).encode("utf-8"),
-            f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8"),
-            binary,
-            b"\r\n",
-            f"--{boundary}--\r\n".encode("utf-8"),
-        ]
-    )
-
-    _, response_body = ebay_request(
-        method="POST",
-        url=f"https://{api_domain}/ws/api.dll",
-        headers={
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "X-EBAY-API-CALL-NAME": "UploadSiteHostedPictures",
-            "X-EBAY-API-COMPATIBILITY-LEVEL": EBAY_API_COMPATIBILITY_LEVEL,
-            "X-EBAY-API-SITEID": site_id,
-            "X-EBAY-API-IAF-TOKEN": access_token,
-        },
-        data=body,
-    )
-
-    root = ET.fromstring(response_body)
-    ack = root.findtext("ebay:Ack", namespaces=EBAY_XML_NS)
-    if ack not in {"Success", "Warning"}:
-        short_message = root.findtext(".//ebay:ShortMessage", namespaces=EBAY_XML_NS) or "Unknown error"
-        long_message = root.findtext(".//ebay:LongMessage", namespaces=EBAY_XML_NS) or ""
-        raise RuntimeError(f"Image upload failed: {short_message} {long_message}".strip())
-
-    full_url = root.findtext(".//ebay:FullURL", namespaces=EBAY_XML_NS)
-    if not full_url:
-        raise RuntimeError("eBay did not return a hosted image URL.")
-    return full_url
-
-
-def create_inventory_item(
-    access_token: str,
-    config: dict[str, str],
-    sku: str,
-    title: str,
-    description: str,
-    brand: str,
-    condition: str,
-    condition_description: str,
-    image_urls: list[str],
-) -> None:
-    aspects: dict[str, list[str]] = {}
-    if brand:
-        aspects["Brand"] = [brand]
-
-    payload: dict[str, Any] = {
-        "availability": {"shipToLocationAvailability": {"quantity": 1}},
-        "condition": condition,
-        "product": {
-            "title": title[:80],
-            "description": description,
-            "imageUrls": image_urls,
-            "aspects": aspects,
-        },
-    }
-
-    if brand:
-        payload["product"]["brand"] = brand
-    if condition_description and condition != "NEW":
-        payload["conditionDescription"] = condition_description
-
-    ebay_request(
-        method="PUT",
-        url=f"https://{config['api_domain']}/sell/inventory/v1/inventory_item/{parse.quote(sku)}",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "Content-Language": config["content_language"],
-        },
-        data=json.dumps(payload).encode("utf-8"),
-    )
-
-
-def create_ebay_offer(
-    access_token: str,
-    config: dict[str, str],
-    publish_config: dict[str, str],
-    sku: str,
-    description: str,
-    price: str,
-) -> str:
-    payload = {
-        "sku": sku,
-        "marketplaceId": config["marketplace_id"],
-        "format": "FIXED_PRICE",
-        "availableQuantity": 1,
-        "categoryId": publish_config["category_id"],
-        "merchantLocationKey": publish_config["merchant_location_key"],
-        "listingPolicies": {
-            "fulfillmentPolicyId": publish_config["fulfillment_policy_id"],
-            "paymentPolicyId": publish_config["payment_policy_id"],
-            "returnPolicyId": publish_config["return_policy_id"],
-        },
-        "listingDuration": publish_config["listing_duration"],
-        "listingDescription": description,
-        "pricingSummary": {
-            "price": {
-                "value": normalize_price_value(price),
-                "currency": "USD",
-            }
-        },
-    }
-
-    _, body = ebay_request(
-        method="POST",
-        url=f"https://{config['api_domain']}/sell/inventory/v1/offer",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "Content-Language": config["content_language"],
-        },
-        data=json.dumps(payload).encode("utf-8"),
-    )
-    response_data = json.loads(body)
-    offer_id = response_data.get("offerId")
-    if not offer_id:
-        raise RuntimeError("eBay did not return an offerId for the draft offer.")
-    return offer_id
-
-
-def publish_ebay_offer(
-    access_token: str,
-    config: dict[str, str],
-    offer_id: str,
-) -> dict[str, Any]:
-    _, body = ebay_request(
-        method="POST",
-        url=f"https://{config['api_domain']}/sell/inventory/v1/offer/{parse.quote(offer_id)}/publish",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "Content-Language": config["content_language"],
-        },
-        data=b"{}",
-    )
-    return json.loads(body) if body.strip() else {}
-
-
-def get_ebay_inventory_locations(access_token: str, config: dict[str, str]) -> list[dict[str, Any]]:
-    _, body = ebay_request(
-        method="GET",
-        url=f"https://{config['api_domain']}/sell/inventory/v1/location",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "Content-Language": config["content_language"],
-        },
-    )
-    data = json.loads(body)
-    return data.get("locations", [])
-
-
-def get_ebay_policies(
-    access_token: str,
-    config: dict[str, str],
-    policy_type: str,
-) -> list[dict[str, Any]]:
-    endpoint_map = {
-        "fulfillment": "fulfillment_policy",
-        "payment": "payment_policy",
-        "return": "return_policy",
-    }
-    endpoint = endpoint_map[policy_type]
-    _, body = ebay_request(
-        method="GET",
-        url=(
-            f"https://{config['api_domain']}/sell/account/v1/{endpoint}?"
-            f"marketplace_id={parse.quote(config['marketplace_id'])}"
-        ),
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "Content-Language": config["content_language"],
-        },
-    )
-    data = json.loads(body)
-    key_map = {
-        "fulfillment": "fulfillmentPolicies",
-        "payment": "paymentPolicies",
-        "return": "returnPolicies",
-    }
-    return data.get(key_map[policy_type], [])
-
-
-def get_ebay_category_suggestions(query: str) -> list[dict[str, Any]]:
-    public_config = get_ebay_public_config()
-    access_token = get_ebay_application_token(public_config)
-    query_string = parse.urlencode({"q": query})
-    _, body = ebay_request(
-        method="GET",
-        url=f"https://{public_config['api_domain']}/commerce/taxonomy/v1/category_tree/0/get_category_suggestions?{query_string}",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "X-EBAY-C-MARKETPLACE-ID": public_config["marketplace_id"],
-        },
-    )
-    data = json.loads(body)
-    return data.get("categorySuggestions", [])
-
-
-def create_ebay_draft_listing(
-    uploaded_files: list[Any],
-    listing_result: dict[str, Any],
-    condition: str,
-    additional_details: str,
-    selected_price_label: str,
-) -> dict[str, str]:
-    config = get_ebay_config()
-    publish_config = get_ebay_publish_config()
-    access_token = get_ebay_user_token(config)
-
-    hosted_image_urls = [
-        upload_image_to_ebay(
-            access_token=access_token,
-            uploaded_file=uploaded_file,
-            site_id=config["site_id"],
-            api_domain=config["api_domain"],
-        )
-        for uploaded_file in uploaded_files[:MAX_IMAGES]
-    ]
-
-    ebay_data = listing_result.get("ebay", {})
-    pricing = listing_result.get("pricing", {})
-    price_options = build_price_options(pricing)
-    selected_price = price_options.get(selected_price_label, "")
-    if not selected_price:
-        raise RuntimeError(f"No generated price available for {selected_price_label}.")
-
-    sku = f"codex-{uuid.uuid4().hex[:12]}"
-    description = format_ebay_description(ebay_data)
-    condition_description = build_condition_description(
-        visible_condition_clues=listing_result.get("visible_condition_clues", []),
-        additional_details=additional_details,
-    )
-
-    create_inventory_item(
-        access_token=access_token,
-        config=config,
-        sku=sku,
-        title=ebay_data.get("title", listing_result.get("product_name", "Untitled item")),
-        description=description,
-        brand=listing_result.get("brand", ""),
-        condition=CONDITION_TO_EBAY_ENUM[condition],
-        condition_description=condition_description,
-        image_urls=hosted_image_urls,
-    )
-    offer_id = create_ebay_offer(
-        access_token=access_token,
-        config=config,
-        publish_config=publish_config,
-        sku=sku,
-        description=description,
-        price=selected_price,
-    )
-
-    return {
-        "offer_id": offer_id,
-        "sku": sku,
-        "price_label": selected_price_label,
-        "price": selected_price,
-    }
-
-
-def create_and_publish_ebay_listing(
-    uploaded_files: list[Any],
-    listing_result: dict[str, Any],
-    condition: str,
-    additional_details: str,
-    selected_price_label: str,
-) -> dict[str, str]:
-    draft_result = create_ebay_draft_listing(
-        uploaded_files=uploaded_files,
-        listing_result=listing_result,
-        condition=condition,
-        additional_details=additional_details,
-        selected_price_label=selected_price_label,
-    )
-
-    config = get_ebay_config()
-    access_token = get_ebay_user_token(config)
-    publish_response = publish_ebay_offer(
-        access_token=access_token,
-        config=config,
-        offer_id=draft_result["offer_id"],
-    )
-
-    listing_id = ""
-    listing_ids = publish_response.get("listingId")
-    if isinstance(listing_ids, str):
-        listing_id = listing_ids
-    elif isinstance(listing_ids, list) and listing_ids:
-        listing_id = str(listing_ids[0])
-
-    return {
-        **draft_result,
-        "listing_id": listing_id,
-    }
 
 
 def render_copy_button(label: str, text: str, key: str) -> None:
