@@ -9,6 +9,7 @@ Create eBay and Facebook Marketplace listing copy from product photos.
 - Add PN / notes / defects
 - Generate eBay and Facebook Marketplace titles and descriptions
 - Optionally use active eBay listings for price comps
+- Open a manual eBay sold/completed search for comparison
 
 ## Use The Hosted App
 

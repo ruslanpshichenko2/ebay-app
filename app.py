@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import html
 import math
 import io
@@ -167,6 +168,19 @@ def format_price_display(price_text: str) -> str:
     return cleaned
 
 
+def format_price_display_rounded(price_text: str) -> str:
+    cleaned = (price_text or "").strip()
+    if not cleaned:
+        return "N/A"
+
+    match = re.search(r"\d[\d,]*(?:\.\d{1,2})?", cleaned)
+    if not match:
+        return cleaned
+
+    value = float(match.group(0).replace(",", ""))
+    return format_usd_rounded(value)
+
+
 def extract_part_number(additional_details: str) -> str:
     text = (additional_details or "").strip()
     if not text:
@@ -220,6 +234,62 @@ def compose_query_variants(listing_result: dict[str, Any], additional_details: s
             variants.append(cleaned)
 
     return variants
+
+
+def build_ebay_sold_search_url(listing_result: dict[str, Any], additional_details: str = "") -> str:
+    query = compose_ebay_search_query(listing_result, additional_details=additional_details)
+    if not query:
+        return "https://www.ebay.com/sch/i.html?LH_Sold=1&LH_Complete=1"
+
+    params = {
+        "_nkw": query,
+        "LH_Sold": "1",
+        "LH_Complete": "1",
+    }
+    return f"https://www.ebay.com/sch/i.html?{parse.urlencode(params)}"
+
+
+def get_relevance_tokens(listing_result: dict[str, Any], additional_details: str = "") -> set[str]:
+    source_parts = [
+        extract_part_number(additional_details),
+        str(listing_result.get("brand", "")),
+        str(listing_result.get("model", "")),
+        str(listing_result.get("product_name", "")),
+    ]
+    stop_words = {
+        "new", "used", "good", "fair", "like", "brand", "module", "unit", "item",
+        "for", "and", "the", "with", "without", "in", "of", "to", "a", "an",
+    }
+
+    tokens: set[str] = set()
+    for source_part in source_parts:
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-./]*", source_part):
+            normalized = token.lower().strip(".-/")
+            if len(normalized) < 3 or normalized in stop_words:
+                continue
+            tokens.add(normalized)
+
+    return tokens
+
+
+def filter_items_by_title_relevance(
+    items: list[dict[str, Any]],
+    relevance_tokens: set[str],
+) -> list[dict[str, Any]]:
+    if not relevance_tokens:
+        return items
+
+    filtered_items: list[dict[str, Any]] = []
+    for item in items:
+        title = str(item.get("title", "")).lower()
+        title_tokens = {
+            token.strip(".-/")
+            for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-./]*", title)
+        }
+        if relevance_tokens & title_tokens:
+            filtered_items.append(item)
+
+    return filtered_items
 
 
 def build_comp_based_ebay_title(existing_title: str, comp_titles: list[str]) -> str:
@@ -446,15 +516,20 @@ def fetch_active_listing_prices(
     listing_result: dict[str, Any],
     condition: str,
     additional_details: str = "",
+    image_search_bytes: Optional[bytes] = None,
+    force_image_search: bool = False,
 ) -> dict[str, Any]:
     config = get_ebay_public_config()
     access_token = get_ebay_application_token(config)
     query_variants = compose_query_variants(listing_result, additional_details=additional_details)
-    if not query_variants:
+    if not query_variants and not image_search_bytes:
         raise RuntimeError("Could not build an eBay search query from the detected item.")
-    primary_query = query_variants[0]
+    primary_query = "image search" if force_image_search else (query_variants[0] if query_variants else "image search")
 
-    cache_key = f"{primary_query.lower()}::{condition}"
+    image_cache_key = ""
+    if image_search_bytes:
+        image_cache_key = hashlib.sha256(image_search_bytes).hexdigest()[:16]
+    cache_key = f"{primary_query.lower()}::{condition}::{image_cache_key}"
     cache_bucket = st.session_state.setdefault("ebay_active_pricing_cache", {})
     cached_entry = cache_bucket.get(cache_key)
     now = time.time()
@@ -511,6 +586,57 @@ def fetch_active_listing_prices(
         data = json.loads(body)
         return data.get("itemSummaries", [])
 
+    def search_active_items_by_image(
+        image_bytes: bytes,
+        include_condition_filter: bool,
+        fixed_price_only: bool,
+    ) -> list[dict[str, Any]]:
+        filters: list[str] = []
+        if fixed_price_only:
+            filters.append("buyingOptions:{FIXED_PRICE}")
+        if include_condition_filter:
+            filters.append(f"conditionIds:{{{CONDITION_TO_EBAY_CONDITION_ID[condition]}}}")
+
+        params = {
+            "limit": "15",
+        }
+        if filters:
+            params["filter"] = ",".join(filters)
+
+        query_string = parse.urlencode(params)
+        url = f"https://{config['api_domain']}/buy/browse/v1/item_summary/search_by_image?{query_string}"
+        payload = json.dumps(
+            {
+                "image": base64.b64encode(image_bytes).decode("utf-8"),
+            }
+        ).encode("utf-8")
+
+        try:
+            _, body = ebay_request(
+                method="POST",
+                url=url,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                    "X-EBAY-C-MARKETPLACE-ID": config["marketplace_id"],
+                },
+                data=payload,
+            )
+        except RuntimeError as exc:
+            exc_text = str(exc)
+            if "RateLimiter" in exc_text or "429" in exc_text:
+                if cached_entry:
+                    return cached_entry["data"].get("raw_items", [])
+                raise RuntimeError(
+                    "eBay image-search pricing is temporarily rate-limited. Please wait a few minutes and try again."
+                ) from exc
+            if "sandbox" in exc_text.lower() and "not supported" in exc_text.lower():
+                raise RuntimeError("eBay image search is not supported in Sandbox.")
+            raise
+
+        data = json.loads(body)
+        return data.get("itemSummaries", [])
+
     search_attempts = [
         (True, True),
         (False, True),
@@ -523,22 +649,74 @@ def fetch_active_listing_prices(
     broadened_query = False
     fixed_price_filter_relaxed = False
     matched_query = primary_query
+    image_result_count = 0
+    image_relevance_filtered = False
+    min_relevant_image_results = 3
+    has_part_number = bool(extract_part_number(additional_details))
 
-    for query_variant in query_variants:
+    def try_image_search() -> bool:
+        nonlocal broadened_query
+        nonlocal fixed_price_filter_relaxed
+        nonlocal image_relevance_filtered
+        nonlocal image_result_count
+        nonlocal item_entries
+        nonlocal matched_query
+        nonlocal relaxed_condition_match
+        nonlocal used_image_search
+
+        if not image_search_bytes or has_part_number:
+            return False
+
+        relevance_tokens = get_relevance_tokens(
+            listing_result=listing_result,
+            additional_details=additional_details,
+        )
         for include_condition_filter, fixed_price_only in search_attempts:
-            item_entries = search_active_items(
-                query=query_variant,
+            image_items = search_active_items_by_image(
+                image_bytes=image_search_bytes,
                 include_condition_filter=include_condition_filter,
                 fixed_price_only=fixed_price_only,
             )
-            if item_entries:
-                matched_query = query_variant
+            image_result_count = len(image_items)
+            filtered_image_items = filter_items_by_title_relevance(image_items, relevance_tokens)
+            image_relevance_filtered = len(filtered_image_items) < image_result_count
+            if filtered_image_items:
+                image_items = filtered_image_items
+
+            if image_items and len(image_items) >= min_relevant_image_results:
+                item_entries = image_items
+                used_image_search = True
+                matched_query = "image search"
                 relaxed_condition_match = not include_condition_filter
                 fixed_price_filter_relaxed = not fixed_price_only
-                broadened_query = query_variant.lower() != primary_query.lower()
+                broadened_query = bool(query_variants)
+                return True
+
+        return False
+
+    used_image_search = False
+    if force_image_search:
+        try_image_search()
+
+    if not item_entries and not force_image_search:
+        for query_variant in query_variants:
+            for include_condition_filter, fixed_price_only in search_attempts:
+                item_entries = search_active_items(
+                    query=query_variant,
+                    include_condition_filter=include_condition_filter,
+                    fixed_price_only=fixed_price_only,
+                )
+                if item_entries:
+                    matched_query = query_variant
+                    relaxed_condition_match = not include_condition_filter
+                    fixed_price_filter_relaxed = not fixed_price_only
+                    broadened_query = query_variant.lower() != primary_query.lower()
+                    break
+            if item_entries:
                 break
-        if item_entries:
-            break
+
+    if not item_entries:
+        try_image_search()
 
     prices: list[float] = []
     comp_rows: list[dict[str, str]] = []
@@ -553,13 +731,17 @@ def fetch_active_listing_prices(
         comp_rows.append(
             {
                 "title": item.get("title", "Untitled listing"),
-                "price": format_usd(item_price),
+                "price": format_usd_rounded(item_price),
                 "item_url": item.get("itemWebUrl", ""),
                 "end_date": item.get("itemEndDate", ""),
             }
         )
 
     if not prices:
+        if image_result_count and image_relevance_filtered:
+            raise RuntimeError(
+                "eBay image search returned results, but too few matched the detected product details."
+            )
         raise RuntimeError("No active eBay listings were returned for this item.")
 
     recommended = {
@@ -572,6 +754,9 @@ def fetch_active_listing_prices(
         "comps": comp_rows[:8],
         "condition_filter_relaxed": relaxed_condition_match,
         "fixed_price_filter_relaxed": fixed_price_filter_relaxed,
+        "used_image_search": used_image_search,
+        "image_result_count": image_result_count,
+        "image_relevance_filtered": image_relevance_filtered,
         "query_broadened": broadened_query,
         "raw_items": item_entries,
     }
@@ -665,7 +850,12 @@ def format_ebay_description(ebay_data: dict[str, Any]) -> str:
     return "\n\n".join(section for section in sections if section)
 
 
-def render_comp_table(title: str, comps: list[dict[str, str]]) -> None:
+def render_comp_table(
+    title: str,
+    comps: list[dict[str, str]],
+    footer_link_url: str = "",
+    footer_link_label: str = "",
+) -> None:
     st.write(f"**{title}**")
     row_html: list[str] = []
     for comp in comps:
@@ -673,7 +863,7 @@ def render_comp_table(title: str, comps: list[dict[str, str]]) -> None:
         item_url = comp.get("item_url", "")
         price = comp.get("price", "N/A")
         safe_title = html.escape(comp_title)
-        safe_price = html.escape(price)
+        safe_price = html.escape(format_price_display_rounded(price))
         if item_url:
             title_html = f'<a href="{html.escape(item_url)}" target="_blank">{safe_title}</a>'
         else:
@@ -687,8 +877,19 @@ def render_comp_table(title: str, comps: list[dict[str, str]]) -> None:
             """
         )
 
+    footer_html = ""
+    if footer_link_url and footer_link_label:
+        footer_html = f"""
+        <div class="comp-footer-link">
+          <a href="{html.escape(footer_link_url)}" target="_blank">{html.escape(footer_link_label)}</a>
+        </div>
+        """
+
     table_html = f"""
         <style>
+          body {{
+            margin: 0;
+          }}
           .comp-table-wrap {{
             width: 100%;
             overflow-x: auto;
@@ -733,6 +934,16 @@ def render_comp_table(title: str, comps: list[dict[str, str]]) -> None:
             color: #f5f8f6;
             font-size: 0.65rem;
           }}
+          .comp-footer-link {{
+            margin-top: 0.95rem;
+            font-family: "SF Pro Display", "SF Pro Text", "Inter", -apple-system, BlinkMacSystemFont,
+              "Segoe UI", sans-serif;
+            font-size: 0.82rem;
+          }}
+          .comp-footer-link a {{
+            color: #4ea1ff;
+            text-decoration: underline;
+          }}
         </style>
         <div class="comp-table-wrap">
           <table class="comp-table">
@@ -751,9 +962,11 @@ def render_comp_table(title: str, comps: list[dict[str, str]]) -> None:
             </tbody>
           </table>
         </div>
+        {footer_html}
         """
     row_count = max(len(comps), 1)
-    components.html(table_html, height=58 + 48 * row_count, scrolling=False)
+    footer_height = 36 if footer_html else 0
+    components.html(table_html, height=46 + 34 * row_count + footer_height, scrolling=False)
 
 
 def show_product_analysis_details(result: dict[str, Any]) -> None:
@@ -809,12 +1022,24 @@ def show_results(result: dict[str, Any], listing_type: str) -> None:
             st.caption("Condition filter was relaxed to find enough active listings.")
         if active_listing_pricing.get("fixed_price_filter_relaxed"):
             st.caption("Fixed-price-only filtering was relaxed to include more live listings.")
+        if active_listing_pricing.get("used_image_search"):
+            st.caption("eBay image search was used for these comps.")
+        if active_listing_pricing.get("image_relevance_filtered"):
+            st.caption("Unrelated image-search matches were filtered out by title relevance.")
         if active_listing_pricing.get("query_broadened"):
             st.caption(
                 f"Search query was broadened to: {active_listing_pricing.get('query', 'N/A')}."
             )
+        sold_search_url = result.get("ebay_sold_search_url")
         if active_listing_pricing.get("comps"):
-            render_comp_table("Active Listing Comps", active_listing_pricing["comps"])
+            render_comp_table(
+                "Active Listing Comps",
+                active_listing_pricing["comps"],
+                footer_link_url=sold_search_url,
+                footer_link_label="Open eBay sold/completed search",
+            )
+        elif sold_search_url:
+            st.markdown(f"[Open eBay sold/completed search]({sold_search_url})")
 
     if show_ebay:
         ebay = result.get("ebay", {})
@@ -875,6 +1100,7 @@ def generate_listing_with_progress(
     condition: str,
     additional_details: str,
     listing_type: str,
+    force_ebay_image_search: bool = False,
 ) -> dict[str, Any]:
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -894,11 +1120,18 @@ def generate_listing_with_progress(
 
     if listing_type in {"Both", "eBay Only"}:
         status_text.write("Checking eBay active listings...")
+        result["ebay_sold_search_url"] = build_ebay_sold_search_url(
+            listing_result=result,
+            additional_details=additional_details,
+        )
         try:
+            image_search_bytes = get_image_bytes_and_mime_type(uploaded_files[0])[0] if uploaded_files else None
             result["ebay_active_listing_pricing"] = fetch_active_listing_prices(
                 listing_result=result,
                 condition=condition,
                 additional_details=additional_details,
+                image_search_bytes=image_search_bytes,
+                force_image_search=force_ebay_image_search,
             )
             result.pop("ebay_active_listing_pricing_error", None)
         except Exception as exc:
@@ -1142,7 +1375,15 @@ def main() -> None:
 
         condition = st.selectbox("Condition", CONDITION_OPTIONS)
         st.write("**Listing Platform**")
-        include_ebay = st.checkbox("eBay", value=True)
+        ebay_option_col, ebay_image_option_col = st.columns([1, 1.4])
+        with ebay_option_col:
+            include_ebay = st.checkbox("eBay", value=True)
+        with ebay_image_option_col:
+            force_ebay_image_search = st.checkbox(
+                "Search eBay by first image",
+                value=False,
+                disabled=not include_ebay,
+            )
         include_facebook = st.checkbox("Facebook Marketplace", value=True)
         listing_type = determine_listing_type(include_ebay, include_facebook)
         additional_details = st.text_area("PN / Notes / Defects", height=100)
@@ -1176,6 +1417,7 @@ def main() -> None:
                     condition=condition,
                     additional_details=additional_details,
                     listing_type=listing_type,
+                    force_ebay_image_search=force_ebay_image_search,
                 )
                 st.session_state["listing_result"] = result
             except json.JSONDecodeError:
